@@ -9,7 +9,7 @@ st.set_page_config(
 )
 st.title("🧾 GP Cargo 發票資料自動轉 Excel 工具")
 st.caption(
-    "專門自動擷取 INVOICE #、DATE、TOTAL 金額，支援批次 PDF 轉換與歷史 Excel 累加！"
+    "已修正：排除左上角地址數字干擾，精確鎖定 INVOICE # 單號（如 26-100737）"
 )
 
 
@@ -22,21 +22,30 @@ def parse_gp_invoice(file_bytes):
             if t:
                 full_text += t + "\n"
 
-    # 1. 擷取 INVOICE # (例如 26-100737)
-    inv_match = re.search(
-        r"INVOICE\s*#?\s*\n?\s*([0-9]{2}-[0-9]+|[A-Za-z0-9\-]+)",
+    # ================= 1. 擷取 INVOICE # (修正重點) =================
+    # 策略 A: 精準匹配 "26-100737" 這種年份開頭帶連字號的單號格式 (2位數-5~6位數)
+    inv_dash_match = re.search(r"\b([0-9]{2}-[0-9]{5,})\b", full_text)
+
+    # 策略 B: 鎖定 INVOICE # 關鍵字下方/右側的號碼，排除純門牌號碼
+    inv_label_match = re.search(
+        r"INVOICE\s*#?\s*\n?\s*([A-Za-z0-9]+-[A-Za-z0-9]+)",
         full_text,
         re.IGNORECASE,
     )
-    invoice_number = ""
-    if inv_match:
-        invoice_number = inv_match.group(1).strip()
-    else:
-        alt_inv = re.search(r"\b(\d{2}-\d{5,})\b", full_text)
-        if alt_inv:
-            invoice_number = alt_inv.group(1).strip()
 
-    # 2. 擷取 DATE (例如 10/07/2026)
+    if inv_dash_match:
+        invoice_number = inv_dash_match.group(1).strip()
+    elif inv_label_match:
+        invoice_number = inv_label_match.group(1).strip()
+    else:
+        # 備援：若格式不同，抓取緊接在 INVOICE # 後面的非空白字串
+        fallback = re.search(
+            r"INVOICE\s*#?\s*[:\s\n]+([A-Za-z0-9\-]+)", full_text, re.IGNORECASE
+        )
+        invoice_number = fallback.group(1).strip() if fallback else ""
+
+    # ================= 2. 擷取 DATE =================
+    # 優先抓表頭 DATE 下方的日期 (例如 10/07/2026 或 10/05/2026)
     date_match = re.search(
         r"DATE\s*\n?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})",
         full_text,
@@ -50,7 +59,8 @@ def parse_gp_invoice(file_bytes):
         )
     invoice_date = date_match.group(1).strip() if date_match else ""
 
-    # 3. 擷取 TOTAL (例如 $4,520 或 4,520.00)
+    # ================= 3. 擷取 TOTAL =================
+    # 抓取底部 TOTAL 後面的金額 (例如 $4,520 或 4,520.00)
     total_match = re.search(
         r"TOTAL\s*\$?\s*([0-9,]+(?:\.[0-9]{2})?)", full_text, re.IGNORECASE
     )
