@@ -9,12 +9,12 @@ st.set_page_config(
 )
 st.title("🧾 GP Cargo 發票資料自動轉 Excel 工具")
 st.caption(
-    "已修正：排除左上角地址數字干擾，精確鎖定 INVOICE # 單號（如 26-100737）"
+    "已新增 4 個欄位：精準擷取 Remark (PO#)、From、To、Material (SKU#)，並支援累加既有 Excel！"
 )
 
 
 def parse_gp_invoice(file_bytes):
-    """解析 GP Cargo 格式發票"""
+    """解析 GP Cargo 格式發票，提取完整 7 大欄位"""
     full_text = ""
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -22,30 +22,18 @@ def parse_gp_invoice(file_bytes):
             if t:
                 full_text += t + "\n"
 
-    # ================= 1. 擷取 INVOICE # (修正重點) =================
-    # 策略 A: 精準匹配 "26-100737" 這種年份開頭帶連字號的單號格式 (2位數-5~6位數)
+    # ================= 1. INVOICE NUMBER =================
+    # 鎖定 26-100508 這類格式，排除左上角地址數字
     inv_dash_match = re.search(r"\b([0-9]{2}-[0-9]{5,})\b", full_text)
-
-    # 策略 B: 鎖定 INVOICE # 關鍵字下方/右側的號碼，排除純門牌號碼
-    inv_label_match = re.search(
-        r"INVOICE\s*#?\s*\n?\s*([A-Za-z0-9]+-[A-Za-z0-9]+)",
-        full_text,
-        re.IGNORECASE,
-    )
-
     if inv_dash_match:
         invoice_number = inv_dash_match.group(1).strip()
-    elif inv_label_match:
-        invoice_number = inv_label_match.group(1).strip()
     else:
-        # 備援：若格式不同，抓取緊接在 INVOICE # 後面的非空白字串
-        fallback = re.search(
-            r"INVOICE\s*#?\s*[:\s\n]+([A-Za-z0-9\-]+)", full_text, re.IGNORECASE
+        inv_label = re.search(
+            r"INVOICE\s*#?\s*\n?\s*([A-Za-z0-9\-]+)", full_text, re.IGNORECASE
         )
-        invoice_number = fallback.group(1).strip() if fallback else ""
+        invoice_number = inv_label.group(1).strip() if inv_label else ""
 
-    # ================= 2. 擷取 DATE =================
-    # 優先抓表頭 DATE 下方的日期 (例如 10/07/2026 或 10/05/2026)
+    # ================= 2. INVOICE DATE =================
     date_match = re.search(
         r"DATE\s*\n?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})",
         full_text,
@@ -59,8 +47,7 @@ def parse_gp_invoice(file_bytes):
         )
     invoice_date = date_match.group(1).strip() if date_match else ""
 
-    # ================= 3. 擷取 TOTAL =================
-    # 抓取底部 TOTAL 後面的金額 (例如 $4,520 或 4,520.00)
+    # ================= 3. TOTAL AMOUNT =================
     total_match = re.search(
         r"TOTAL\s*\$?\s*([0-9,]+(?:\.[0-9]{2})?)", full_text, re.IGNORECASE
     )
@@ -69,10 +56,59 @@ def parse_gp_invoice(file_bytes):
         val = total_match.group(1).strip()
         total_amount = f"${val}"
 
+    # ================= 4. REMARK (紅色底線) =================
+    # 策略 A: 優先抓第 1 行 "Trucking Shipping Fee <代碼> from"
+    remark = ""
+    fee_match = re.search(
+        r"Trucking\s+Shipping\s+Fee\s+([A-Za-z0-9]+)\s+from",
+        full_text,
+        re.IGNORECASE,
+    )
+    if fee_match:
+        remark = fee_match.group(1).strip()
+    else:
+        # 策略 B: 從下方的 PO# 抓取代碼 (例如 PO#FCU260924008)
+        po_match = re.search(
+            r"PO#?\s*([A-Za-z0-9]+)", full_text, re.IGNORECASE
+        )
+        if po_match:
+            remark = po_match.group(1).strip()
+
+    # ================= 5. FROM (橘色底線) =================
+    # 抓取 "from GP-75234 to" 中的 GP-75234
+    from_val = ""
+    from_match = re.search(
+        r"\bfrom\s+([A-Za-z0-9\-]+)\s+to\b", full_text, re.IGNORECASE
+    )
+    if from_match:
+        from_val = from_match.group(1).strip()
+
+    # ================= 6. TO (黃色底線) =================
+    # 抓取 "to TZR4" 中的 TZR4 (遇到換行、空格或結尾截斷)
+    to_val = ""
+    to_match = re.search(
+        r"\bto\s+([A-Za-z0-9\-]+)(?:\s+|\n|$)", full_text, re.IGNORECASE
+    )
+    if to_match:
+        to_val = to_match.group(1).strip()
+
+    # ================= 7. MATERIAL (綠色底線) =================
+    # 抓取 "SKU#CLSCU-AA401-S" 中的代碼
+    material = ""
+    sku_match = re.search(
+        r"SKU#?\s*([A-Za-z0-9\-]+)", full_text, re.IGNORECASE
+    )
+    if sku_match:
+        material = sku_match.group(1).strip()
+
     return {
         "INVOICE NUMBER": invoice_number,
         "INVOICE DATE": invoice_date,
         "TOTAL AMOUNT": total_amount,
+        "REMARK": remark,
+        "FROM": from_val,
+        "TO": to_val,
+        "MATERIAL": material,
     }
 
 
@@ -107,12 +143,12 @@ if uploaded_files:
 
     new_df = pd.DataFrame(records)
 
-    # 合併既有 Excel 邏輯
+    # 累加合併既有 Excel 邏輯
     if existing_file:
         try:
             old_df = pd.read_excel(existing_file)
             final_df = pd.concat([old_df, new_df], ignore_index=True)
-            # 自動去重（依據 INVOICE NUMBER 保留最新）
+            # 依 INVOICE NUMBER 移除重複（保留最新）
             if "INVOICE NUMBER" in final_df.columns:
                 final_df = final_df.drop_duplicates(
                     subset=["INVOICE NUMBER"], keep="last"
